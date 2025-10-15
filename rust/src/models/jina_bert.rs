@@ -27,6 +27,8 @@ pub struct Config {
     pub layer_norm_eps: f64,
     pub pad_token_id: usize,
     pub position_embedding_type: PositionEmbeddingType,
+    #[serde(default)]
+    pub model_type: Option<String>,
 }
 
 impl Config {
@@ -45,6 +47,7 @@ impl Config {
             layer_norm_eps: 1e-12,
             pad_token_id: 0,
             position_embedding_type: PositionEmbeddingType::Alibi,
+            model_type: None,
         }
     }
 
@@ -76,6 +79,7 @@ impl Config {
             layer_norm_eps,
             pad_token_id,
             position_embedding_type,
+            model_type: None,
         }
     }
 }
@@ -245,22 +249,99 @@ struct BertGLUMLP {
 }
 
 impl BertGLUMLP {
-    fn new(vb: VarBuilder, cfg: &Config) -> Result<Self> {
-        let gated_layers = linear_no_bias(
-            cfg.hidden_size,
-            cfg.intermediate_size * 2,
-            vb.pp("gated_layers"),
-        )?;
-        let act = candle_nn::Activation::Gelu; // geglu
-        let wo = linear(cfg.intermediate_size, cfg.hidden_size, vb.pp("wo"))?;
-        let layernorm = layer_norm(cfg.hidden_size, cfg.layer_norm_eps, vb.pp("layernorm"))?;
-        Ok(Self {
-            gated_layers,
-            act,
-            wo,
-            layernorm,
-            intermediate_size: cfg.intermediate_size,
-        })
+    fn new(mlp_vb: VarBuilder, layer_vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        // Allow explicit routing when `model_type` is provided in config.json
+        //  - "jina_code_bert" => use code-layout names
+        //  - "jina_bert"      => use legacy jina names
+        if let Some(mt) = cfg.model_type.as_deref() {
+            match mt {
+                "jina_code_bert" => {
+                    let gated_layers = linear_no_bias(
+                        cfg.hidden_size,
+                        cfg.intermediate_size * 2,
+                        mlp_vb.pp("up_gated_layer"),
+                    )?;
+                    let act = candle_nn::Activation::Gelu; // geglu
+                    let wo = linear(
+                        cfg.intermediate_size,
+                        cfg.hidden_size,
+                        mlp_vb.pp("down_layer"),
+                    )?;
+                    let layernorm = layer_norm(
+                        cfg.hidden_size,
+                        cfg.layer_norm_eps,
+                        layer_vb.pp("layer_norm_2"),
+                    )?;
+                    return Ok(Self {
+                        gated_layers,
+                        act,
+                        wo,
+                        layernorm,
+                        intermediate_size: cfg.intermediate_size,
+                    });
+                }
+                "jina_bert" => {
+                    let gated_layers = linear_no_bias(
+                        cfg.hidden_size,
+                        cfg.intermediate_size * 2,
+                        mlp_vb.pp("gated_layers"),
+                    )?;
+                    let act = candle_nn::Activation::Gelu; // geglu
+                    let wo = linear(cfg.intermediate_size, cfg.hidden_size, mlp_vb.pp("wo"))?;
+                    let layernorm = layer_norm(
+                        cfg.hidden_size,
+                        cfg.layer_norm_eps,
+                        mlp_vb.pp("layernorm"),
+                    )?;
+                    return Ok(Self {
+                        gated_layers,
+                        act,
+                        wo,
+                        layernorm,
+                        intermediate_size: cfg.intermediate_size,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Otherwise auto-detect by trying code layout first, then legacy.
+        let try_code = || -> Result<Self> {
+            let gated_layers = linear_no_bias(
+                cfg.hidden_size,
+                cfg.intermediate_size * 2,
+                mlp_vb.pp("up_gated_layer"),
+            )?;
+            let act = candle_nn::Activation::Gelu; // geglu
+            let wo = linear(cfg.intermediate_size, cfg.hidden_size, mlp_vb.pp("down_layer"))?;
+            // Layer norm for the MLP block lives at layer scope as `layer_norm_2`
+            let layernorm = layer_norm(
+                cfg.hidden_size,
+                cfg.layer_norm_eps,
+                layer_vb.pp("layer_norm_2"),
+            )?;
+            Ok(Self { gated_layers, act, wo, layernorm, intermediate_size: cfg.intermediate_size })
+        };
+
+        match try_code() {
+            Ok(s) => Ok(s),
+            Err(_e) => {
+                // Fallback to legacy Jina naming used by older checkpoints.
+                let gated_layers = linear_no_bias(
+                    cfg.hidden_size,
+                    cfg.intermediate_size * 2,
+                    mlp_vb.pp("gated_layers"),
+                )?;
+                let act = candle_nn::Activation::Gelu; // geglu
+                let wo = linear(cfg.intermediate_size, cfg.hidden_size, mlp_vb.pp("wo"))?;
+                let layernorm = layer_norm(
+                    cfg.hidden_size,
+                    cfg.layer_norm_eps,
+                    mlp_vb.pp("layernorm"),
+                )?;
+                Ok(Self { gated_layers, act, wo, layernorm, intermediate_size: cfg.intermediate_size })
+            }
+        }
     }
 }
 
@@ -285,7 +366,7 @@ struct BertLayer {
 impl BertLayer {
     fn new(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let attention = BertAttention::new(vb.pp("attention"), cfg)?;
-        let mlp = BertGLUMLP::new(vb.pp("mlp"), cfg)?;
+        let mlp = BertGLUMLP::new(vb.pp("mlp"), vb.clone(), cfg)?;
         Ok(Self {
             attention,
             mlp,

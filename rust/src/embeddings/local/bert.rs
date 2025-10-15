@@ -17,7 +17,7 @@ use candle_transformers::models::bert::{BertForMaskedLM, BertModel, Config, DTYP
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::Repo;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use tokenizers::{AddedToken, PaddingParams, Tokenizer, TruncationParams};
 
 use super::pooling::{ModelOutput, PooledOutputType, Pooling};
@@ -34,8 +34,27 @@ pub trait BertEmbed {
 pub struct TokenizerConfig {
     pub max_length: Option<usize>,
     pub model_max_length: Option<usize>,
+    // Some tokenizers (e.g., Jina v2) store mask_token as an object (AddedToken).
+    // Accept both string and object, but expose it as String for callers.
+    #[serde(default, deserialize_with = "mask_token_from_any")]
     pub mask_token: Option<String>,
     pub added_tokens_decoder: Option<HashMap<String, AddedToken>>,
+}
+
+fn mask_token_from_any<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let val = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let out = match val {
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(serde_json::Value::Object(map)) => map
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        _ => None,
+    };
+    Ok(out)
 }
 
 impl TokenizerConfig {

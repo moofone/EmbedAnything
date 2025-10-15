@@ -81,8 +81,23 @@ impl JinaEmbedder {
             (None, None) => 256,
         };
 
-        let config = std::fs::read_to_string(config_filename)?;
-        let config: Config = serde_json::from_str(&config)?;
+        let config_str = std::fs::read_to_string(config_filename)?;
+        eprintln!("DEBUG: Reading config.json from repo: {}", model_id);
+        if let Ok(cfg_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+            let name_or_path = cfg_json
+                .get("_name_or_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unset>");
+            eprintln!(
+                "DEBUG: config._name_or_path='{}' (may differ from repo id; supplied by upstream)",
+                name_or_path
+            );
+        }
+        eprintln!(
+            "DEBUG: First 500 chars of config.json:\n{}",
+            &config_str[..config_str.len().min(500)]
+        );
+        let config: Config = serde_json::from_str(&config_str)?;
         let device = select_device();
         let vb = match api.get("model.safetensors") {
             Ok(safetensors) => unsafe {
